@@ -23,6 +23,10 @@ warnings.filterwarnings('ignore')
 class ChatLogParser:
     """Parse chat logs from various file formats"""
 
+    _TIMESTAMP_RE = re.compile(
+        r'([A-Z][a-z]{2,3} \d{1,2}, \d{4}, \d{1,2}:\d{2}:\d{2}[\s\u202f]+[AP]M [A-Z]{3})'
+    )
+
     @staticmethod
     def parse_html(file_path: str) -> List[Dict[str, str]]:
         """
@@ -43,46 +47,77 @@ class ChatLogParser:
         conversation_cells = soup.find_all('div', class_='outer-cell')
 
         for cell in conversation_cells:
-            content_div = cell.find('div', class_='content-cell mdl-cell--6-col')
+            # Find content div with flexible class matching
+            content_div = cell.find('div', class_=lambda x: x and 'content-cell' in x and 'mdl-cell--6-col' in x and 'mdl-typography--body-1' in x)
             if not content_div:
                 continue
 
-            # Get the full content
-            full_text = content_div.get_text(separator='\n', strip=True)
+            # Get children to parse structured content
+            children = list(content_div.children)
+            if not children:
+                continue
 
-            # Split by "Prompted" to separate user message from AI response
-            if 'Prompted' in full_text:
-                parts = full_text.split('Prompted', 1)
-                if len(parts) > 1:
-                    # Extract user message (everything before the first timestamp)
-                    user_part = parts[1]
+            # First text node should contain "Prompted [AI_summary] [USER_question]"
+            first_text = str(children[0]) if children else ""
 
-                    # Timestamp pattern: "MMM DD, YYYY, HH:MM:SS AM/PM ZONE"
-                    timestamp_pattern = r'([A-Z][a-z]{2} \d{1,2}, \d{4}, \d{1,2}:\d{2}:\d{2} [AP]M [A-Z]{3})'
-                    timestamp_match = re.search(timestamp_pattern, user_part)
+            if 'Prompted' not in first_text:
+                continue
 
-                    if timestamp_match:
-                        timestamp = timestamp_match.group(1)
-                        # User message is before the timestamp
-                        user_text = user_part[:timestamp_match.start()].strip()
-                        # AI response is after the timestamp
-                        ai_text = user_part[timestamp_match.end():].strip()
+            # Split by "Prompted" and handle the content after it
+            parts = first_text.split('Prompted', 1)
+            if len(parts) <= 1:
+                continue
 
-                        # Add user message
-                        if user_text:
-                            messages.append({
-                                'speaker': 'User',
-                                'text': user_text,
-                                'timestamp': timestamp
-                            })
+            prompted_content = parts[1].strip()
 
-                        # Add AI message
-                        if ai_text:
-                            messages.append({
-                                'speaker': 'AI',
-                                'text': ai_text,
-                                'timestamp': timestamp
-                            })
+            # The user question is usually after a double newline
+            # Format: AI_summary\n\nUSER_question
+            content_parts = prompted_content.split('\n\n', 1)
+
+            user_text = ""
+            if len(content_parts) == 2:
+                # There's a clear separation - second part is user question
+                user_text = content_parts[1].strip()
+            elif len(content_parts) == 1:
+                # No separation - the whole thing might be the user question
+                # This happens when there's no AI summary
+                user_text = content_parts[0].strip()
+
+            # Single pass: find timestamp then collect AI text
+            timestamp = "N/A"
+            ai_text_parts = []
+            found_timestamp = False
+
+            for child in children:
+                child_str = str(child).strip()
+                if not found_timestamp:
+                    match = ChatLogParser._TIMESTAMP_RE.search(child_str)
+                    if match:
+                        timestamp = match.group(1)
+                        found_timestamp = True
+                    continue
+                if hasattr(child, 'get_text'):
+                    text = child.get_text(separator=' ', strip=True)
+                    if text:
+                        ai_text_parts.append(text)
+
+            ai_text = ' '.join(ai_text_parts)
+
+            # Add user message
+            if user_text and len(user_text) > 10:
+                messages.append({
+                    'speaker': 'User',
+                    'text': user_text,
+                    'timestamp': timestamp
+                })
+
+            # Add AI message
+            if ai_text and len(ai_text) > 10:
+                messages.append({
+                    'speaker': 'AI',
+                    'text': ai_text,
+                    'timestamp': timestamp
+                })
 
         return messages
 
@@ -104,15 +139,14 @@ class ChatLogParser:
         if 'speaker' not in df.columns or 'text' not in df.columns:
             raise ValueError("CSV must contain 'speaker' and 'text' columns")
 
-        messages = []
-        for _, row in df.iterrows():
-            messages.append({
+        return [
+            {
                 'speaker': str(row['speaker']),
                 'text': str(row['text']),
                 'timestamp': str(row.get('timestamp', 'N/A'))
-            })
-
-        return messages
+            }
+            for row in df.to_dict('records')
+        ]
 
     @staticmethod
     def parse_json(file_path: str) -> List[Dict[str, str]]:
@@ -148,6 +182,14 @@ class ChatLogParser:
 class TextPreprocessor:
     """Clean and preprocess text for NLP"""
 
+    _HTML_RE = re.compile(r'<[^>]+>')
+    _URL_RE = re.compile(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+')
+    _EMAIL_RE = re.compile(r'\S+@\S+')
+    _WHITESPACE_RE = re.compile(r'\s+')
+    _SKIP_RE = re.compile(
+        r'^Attached \d+ file|^- \s*<a href|^Products:|^Why is this here\?'
+    )
+
     @staticmethod
     def clean_text(text: str) -> str:
         """
@@ -159,22 +201,14 @@ class TextPreprocessor:
         Returns:
             Cleaned text
         """
-        # Remove HTML tags if any remain
-        text = re.sub(r'<[^>]+>', '', text)
+        if not isinstance(text, str):
+            return ""
 
-        # Remove URLs
-        text = re.sub(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', '', text)
-
-        # Remove email addresses
-        text = re.sub(r'\S+@\S+', '', text)
-
-        # Remove extra whitespace
-        text = re.sub(r'\s+', ' ', text)
-
-        # Strip leading/trailing whitespace
-        text = text.strip()
-
-        return text
+        text = TextPreprocessor._HTML_RE.sub('', text)
+        text = TextPreprocessor._URL_RE.sub('', text)
+        text = TextPreprocessor._EMAIL_RE.sub('', text)
+        text = TextPreprocessor._WHITESPACE_RE.sub(' ', text)
+        return text.strip()
 
     @staticmethod
     def is_valid_message(text: str, min_length: int = 10) -> bool:
@@ -188,20 +222,11 @@ class TextPreprocessor:
         Returns:
             True if valid
         """
-        if not text or len(text) < min_length:
+        if not isinstance(text, str) or len(text) < min_length:
             return False
 
-        # Skip messages that are just file attachments or metadata
-        skip_patterns = [
-            r'^Attached \d+ file',
-            r'^- \s*<a href',
-            r'^Products:',
-            r'^Why is this here\?'
-        ]
-
-        for pattern in skip_patterns:
-            if re.match(pattern, text):
-                return False
+        if TextPreprocessor._SKIP_RE.match(text):
+            return False
 
         return True
 
@@ -209,15 +234,23 @@ class TextPreprocessor:
 class SentimentAnalyzer:
     """Perform sentiment analysis using transformer models"""
 
-    def __init__(self, model_name: str = "distilbert-base-uncased-finetuned-sst-2-english"):
+    def __init__(self, model_name: str = "lxyuan/distilbert-base-multilingual-cased-sentiments-student"):
         """
         Initialize sentiment analyzer
 
         Args:
             model_name: HuggingFace model name
         """
-        print(f"Loading sentiment analysis model: {model_name}")
-        self.analyzer = pipeline("sentiment-analysis", model=model_name, truncation=True, max_length=512)
+        import torch
+        device = 0 if torch.cuda.is_available() else -1
+        device_label = "GPU" if device == 0 else "CPU"
+        torch_dtype = torch.float16 if device == 0 else torch.float32
+        print(f"Loading sentiment analysis model: {model_name} (using {device_label})")
+        self.analyzer = pipeline(
+            "sentiment-analysis", model=model_name,
+            truncation=True, max_length=512,
+            device=device, torch_dtype=torch_dtype
+        )
         print("Model loaded successfully!")
 
     def analyze_message(self, text: str) -> Dict[str, float]:
@@ -238,39 +271,60 @@ class SentimentAnalyzer:
 
         # Convert to normalized score (-1 to 1)
         # Positive sentiment: 0 to 1
+        # Neutral sentiment: 0
         # Negative sentiment: 0 to -1
-        if result['label'] == 'POSITIVE':
+        if result['label'] == 'positive':
             score = result['score']
-        else:  # NEGATIVE
+        elif result['label'] == 'negative':
             score = -result['score']
+        else:  # neutral
+            score = 0.0
 
         return {
             'label': result['label'],
             'score': score
         }
 
-    def analyze_messages(self, messages: List[Dict[str, str]]) -> pd.DataFrame:
+    def analyze_messages(self, messages: List[Dict[str, str]], batch_size: int = 32) -> pd.DataFrame:
         """
-        Analyze sentiment for all messages
+        Analyze sentiment for all messages using batch processing
 
         Args:
             messages: List of message dictionaries
+            batch_size: Number of messages to process at once
 
         Returns:
             DataFrame with messages and sentiment scores
         """
-        results = []
+        texts = []
+        for msg in messages:
+            text = msg['text']
+            if len(text) > 2000:
+                text = text[:2000]
+            texts.append(text)
 
-        print("Analyzing sentiment for each message...")
-        for msg in tqdm(messages, desc="Processing messages"):
-            sentiment = self.analyze_message(msg['text'])
+        print(f"Analyzing sentiment for {len(texts)} messages (batch_size={batch_size})...")
+        raw_results = []
+        for i in tqdm(range(0, len(texts), batch_size), desc="Processing batches"):
+            batch = texts[i:i + batch_size]
+            raw_results.extend(self.analyzer(batch))
+
+        results = []
+        for msg, sentiment in zip(messages, raw_results):
+            label = sentiment['label']
+            if label == 'positive':
+                score = sentiment['score']
+            elif label == 'negative':
+                score = -sentiment['score']
+            else:  # neutral
+                score = 0.0
             results.append({
                 'speaker': msg['speaker'],
                 'text': msg['text'][:100] + '...' if len(msg['text']) > 100 else msg['text'],
                 'full_text': msg['text'],
                 'timestamp': msg.get('timestamp', 'N/A'),
-                'sentiment_label': sentiment['label'],
-                'sentiment_score': sentiment['score']
+                'sentiment_label': label,
+                'sentiment_score': score
             })
 
         return pd.DataFrame(results)
@@ -295,6 +349,7 @@ class SentimentVisualizer:
 
         speaker_stats.columns = ['mean_score', 'std_score', 'message_count']
         speaker_stats = speaker_stats.reset_index()
+        speaker_stats['std_score'] = speaker_stats['std_score'].fillna(0)
 
         # Create figure with subplots
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
@@ -387,6 +442,8 @@ Examples:
     parser.add_argument('--export', type=str, help='Export detailed results to CSV')
     parser.add_argument('--min-length', type=int, default=10,
                        help='Minimum message length to analyze (default: 10)')
+    parser.add_argument('--batch-size', type=int, default=32,
+                       help='Batch size for sentiment analysis (default: 32, increase for GPU)')
 
     args = parser.parse_args()
 
@@ -436,7 +493,7 @@ Examples:
 
     # Perform sentiment analysis
     analyzer = SentimentAnalyzer()
-    results_df = analyzer.analyze_messages(valid_messages)
+    results_df = analyzer.analyze_messages(valid_messages, batch_size=args.batch_size)
 
     # Export detailed results if requested
     if args.export:
@@ -450,3 +507,4 @@ Examples:
 
 if __name__ == "__main__":
     main()
+

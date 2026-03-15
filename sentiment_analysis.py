@@ -6,18 +6,50 @@ Analyzes sentiment from chat logs (CSV, HTML, or JSON) and visualizes results.
 
 import re
 import argparse
+from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Tuple
+from typing import List, Dict, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor
 from bs4 import BeautifulSoup
 import pandas as pd
 import json
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 import numpy as np
 from transformers import pipeline
 from tqdm import tqdm
 import warnings
 
 warnings.filterwarnings('ignore')
+
+_TIMESTAMP_PARSE_RE = re.compile(
+    r'([A-Z][a-z]{2,3}) (\d{1,2}), (\d{4}), (\d{1,2}):(\d{2}):(\d{2})[\s\u202f]+([AP]M)'
+)
+
+
+def parse_timestamp(ts: str) -> Optional[datetime]:
+    """
+    Parse a Google Takeout-style timestamp string into a datetime object.
+
+    Handles strings like "Dec 3, 2024, 9:06:45 AM EST" (timezone suffix is ignored).
+
+    Args:
+        ts: Raw timestamp string
+
+    Returns:
+        datetime object, or None if parsing fails
+    """
+    if not ts or ts == 'N/A':
+        return None
+    m = _TIMESTAMP_PARSE_RE.search(ts)
+    if not m:
+        return None
+    month_str, day, year, hour, minute, second, ampm = m.groups()
+    try:
+        dt_str = f"{month_str} {day} {year} {hour}:{minute}:{second} {ampm}"
+        return datetime.strptime(dt_str, "%b %d %Y %I:%M:%S %p")
+    except ValueError:
+        return None
 
 
 class ChatLogParser:
@@ -149,6 +181,46 @@ class ChatLogParser:
         ]
 
     @staticmethod
+    def parse_jsonl(file_path: str, max_records: int = None) -> List[Dict[str, str]]:
+        """
+        Parse JSONL format (e.g. Databricks/Dolly dataset)
+        Maps 'instruction' -> User, 'response' -> AI
+
+        Args:
+            file_path: Path to JSONL file
+            max_records: Maximum number of JSONL records to read (optional)
+
+        Returns:
+            List of dictionaries with 'speaker', 'text', and 'timestamp'
+        """
+        messages = []
+        records_read = 0
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                if max_records is not None and records_read >= max_records:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                item = json.loads(line)
+                instruction = item.get('instruction', '').strip()
+                response = item.get('response', '').strip()
+                if instruction:
+                    messages.append({
+                        'speaker': 'User',
+                        'text': instruction,
+                        'timestamp': 'N/A'
+                    })
+                if response:
+                    messages.append({
+                        'speaker': 'AI',
+                        'text': response,
+                        'timestamp': 'N/A'
+                    })
+                records_read += 1
+        return messages
+
+    @staticmethod
     def parse_json(file_path: str) -> List[Dict[str, str]]:
         """
         Parse JSON format chat logs
@@ -168,13 +240,29 @@ class ChatLogParser:
 
         messages = []
         for item in data:
-            if 'speaker' not in item or 'text' not in item:
-                continue
-            messages.append({
-                'speaker': str(item['speaker']),
-                'text': str(item['text']),
-                'timestamp': str(item.get('timestamp', 'N/A'))
-            })
+            # Support speaker/text format
+            if 'speaker' in item and 'text' in item:
+                messages.append({
+                    'speaker': str(item['speaker']),
+                    'text': str(item['text']),
+                    'timestamp': str(item.get('timestamp', 'N/A'))
+                })
+            # Support instruction/response format (e.g. Dolly/Databricks dataset)
+            elif 'instruction' in item or 'response' in item:
+                instruction = item.get('instruction', '').strip()
+                response = item.get('response', '').strip()
+                if instruction:
+                    messages.append({
+                        'speaker': 'User',
+                        'text': instruction,
+                        'timestamp': 'N/A'
+                    })
+                if response:
+                    messages.append({
+                        'speaker': 'AI',
+                        'text': response,
+                        'timestamp': 'N/A'
+                    })
 
         return messages
 
@@ -251,6 +339,14 @@ class SentimentAnalyzer:
             truncation=True, max_length=512,
             device=device, torch_dtype=torch_dtype
         )
+        # Compile model for faster inference on PyTorch 2.0+
+        try:
+            self.analyzer.model = torch.compile(self.analyzer.model)
+            print("Model compiled with torch.compile for faster inference.")
+        except Exception:
+            pass
+        # Warm up the model to avoid cold-start latency on first real batch
+        self.analyzer("warm up", batch_size=1)
         print("Model loaded successfully!")
 
     def analyze_message(self, text: str) -> Dict[str, float]:
@@ -285,7 +381,7 @@ class SentimentAnalyzer:
             'score': score
         }
 
-    def analyze_messages(self, messages: List[Dict[str, str]], batch_size: int = 32) -> pd.DataFrame:
+    def analyze_messages(self, messages: List[Dict[str, str]], batch_size: int = 64) -> pd.DataFrame:
         """
         Analyze sentiment for all messages using batch processing
 
@@ -296,36 +392,28 @@ class SentimentAnalyzer:
         Returns:
             DataFrame with messages and sentiment scores
         """
-        texts = []
-        for msg in messages:
-            text = msg['text']
-            if len(text) > 2000:
-                text = text[:2000]
-            texts.append(text)
+        # Truncate texts in a single pass (avoids re-slicing later)
+        texts = [msg['text'][:2000] for msg in messages]
 
         print(f"Analyzing sentiment for {len(texts)} messages (batch_size={batch_size})...")
         raw_results = []
         for i in tqdm(range(0, len(texts), batch_size), desc="Processing batches"):
-            batch = texts[i:i + batch_size]
-            raw_results.extend(self.analyzer(batch))
+            raw_results.extend(self.analyzer(texts[i:i + batch_size]))
 
-        results = []
-        for msg, sentiment in zip(messages, raw_results):
-            label = sentiment['label']
-            if label == 'positive':
-                score = sentiment['score']
-            elif label == 'negative':
-                score = -sentiment['score']
-            else:  # neutral
-                score = 0.0
-            results.append({
+        # Build results in a single pass without intermediate dicts
+        _score_map = {'positive': 1, 'negative': -1, 'neutral': 0}
+        results = [
+            {
                 'speaker': msg['speaker'],
                 'text': msg['text'][:100] + '...' if len(msg['text']) > 100 else msg['text'],
                 'full_text': msg['text'],
                 'timestamp': msg.get('timestamp', 'N/A'),
-                'sentiment_label': label,
-                'sentiment_score': score
-            })
+                'datetime_parsed': parse_timestamp(msg.get('timestamp', 'N/A')),
+                'sentiment_label': s['label'],
+                'sentiment_score': s['score'] * _score_map.get(s['label'], 0),
+            }
+            for msg, s in zip(messages, raw_results)
+        ]
 
         return pd.DataFrame(results)
 
@@ -424,6 +512,120 @@ class SentimentVisualizer:
             print(f"  Interpretation: {interpretation}")
         print("="*60)
 
+    @staticmethod
+    def plot_sentiment_over_time(df: pd.DataFrame, output_path: str = None):
+        """
+        Plot sentiment scores over time (monthly if real timestamps exist,
+        otherwise by equal-sized message-sequence buckets).
+
+        Args:
+            df: DataFrame with sentiment analysis results, must contain
+                'datetime_parsed', 'speaker', and 'sentiment_score' columns
+            output_path: Path to save the plot (optional)
+        """
+        has_real_ts = df['datetime_parsed'].notna().any()
+
+        speakers = sorted(df['speaker'].unique())
+        colors = {'User': '#3b82f6', 'AI': '#10b981'}
+
+        if has_real_ts:
+            # ---- Real-timestamp path ----------------------------------------
+            df_ts = df[df['datetime_parsed'].notna()].copy()
+            df_ts['period'] = df_ts['datetime_parsed'].dt.to_period('M')
+
+            # Determine granularity based on date range
+            date_range = (df_ts['datetime_parsed'].max() - df_ts['datetime_parsed'].min()).days
+            if date_range <= 60:
+                df_ts['period'] = df_ts['datetime_parsed'].dt.to_period('W')
+                x_label = 'Week'
+            elif date_range <= 730:
+                df_ts['period'] = df_ts['datetime_parsed'].dt.to_period('M')
+                x_label = 'Month'
+            else:
+                df_ts['period'] = df_ts['datetime_parsed'].dt.to_period('Q')
+                x_label = 'Quarter'
+
+            grouped = (
+                df_ts.groupby(['period', 'speaker'])['sentiment_score']
+                .mean()
+                .reset_index()
+            )
+            grouped['period_dt'] = grouped['period'].dt.to_timestamp()
+
+            fig, ax = plt.subplots(figsize=(14, 6))
+
+            for speaker in speakers:
+                sub = grouped[grouped['speaker'] == speaker].sort_values('period_dt')
+                if sub.empty:
+                    continue
+                color = colors.get(speaker, '#6366f1')
+                ax.plot(sub['period_dt'], sub['sentiment_score'],
+                        marker='o', label=speaker, color=color, linewidth=2, markersize=5)
+                ax.fill_between(sub['period_dt'], sub['sentiment_score'],
+                                alpha=0.12, color=color)
+
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
+            fig.autofmt_xdate()
+            ax.set_xlabel(x_label, fontsize=12, fontweight='bold')
+            title_suffix = f"per {x_label}"
+            coverage = (
+                f"{df_ts['datetime_parsed'].min().strftime('%b %Y')} – "
+                f"{df_ts['datetime_parsed'].max().strftime('%b %Y')}"
+            )
+            n_without_ts = df['datetime_parsed'].isna().sum()
+            if n_without_ts:
+                print(f"  Note: {n_without_ts} messages had no timestamp and are excluded from the time-series plot.")
+
+        else:
+            # ---- Index-based sequence path ----------------------------------
+            n = len(df)
+            n_buckets = max(5, min(30, n // max(1, n // 20)))
+            df = df.copy()
+            df['bucket'] = pd.cut(df.index, bins=n_buckets, labels=False)
+
+            grouped = (
+                df.groupby(['bucket', 'speaker'])['sentiment_score']
+                .mean()
+                .reset_index()
+            )
+
+            fig, ax = plt.subplots(figsize=(14, 6))
+
+            for speaker in speakers:
+                sub = grouped[grouped['speaker'] == speaker].sort_values('bucket')
+                if sub.empty:
+                    continue
+                color = colors.get(speaker, '#6366f1')
+                ax.plot(sub['bucket'], sub['sentiment_score'],
+                        marker='o', label=speaker, color=color, linewidth=2, markersize=5)
+                ax.fill_between(sub['bucket'], sub['sentiment_score'],
+                                alpha=0.12, color=color)
+
+            ax.set_xlabel('Message Sequence (groups of ~equal size)', fontsize=12, fontweight='bold')
+            title_suffix = "over Message Sequence"
+            coverage = f"{n} messages, {n_buckets} groups"
+            print("  Note: No timestamps found in data — using message order as the time axis.")
+
+        ax.set_ylabel('Average Sentiment Score', fontsize=12, fontweight='bold')
+        ax.set_title(f'Sentiment {title_suffix}\n({coverage})', fontsize=14, fontweight='bold')
+        ax.axhline(y=0, color='gray', linestyle='--', linewidth=1, alpha=0.5)
+        ax.set_ylim(-1, 1)
+        ax.grid(axis='y', alpha=0.3)
+        ax.legend(fontsize=11)
+
+        plt.tight_layout()
+
+        if output_path:
+            stem = Path(output_path).stem
+            suffix = Path(output_path).suffix or '.png'
+            ts_path = str(Path(output_path).parent / f"{stem}_over_time{suffix}")
+        else:
+            ts_path = 'sentiment_over_time.png'
+
+        plt.savefig(ts_path, dpi=300, bbox_inches='tight')
+        print(f"Time-series visualization saved to: {ts_path}")
+        plt.show()
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -442,8 +644,12 @@ Examples:
     parser.add_argument('--export', type=str, help='Export detailed results to CSV')
     parser.add_argument('--min-length', type=int, default=10,
                        help='Minimum message length to analyze (default: 10)')
-    parser.add_argument('--batch-size', type=int, default=32,
-                       help='Batch size for sentiment analysis (default: 32, increase for GPU)')
+    parser.add_argument('--batch-size', type=int, default=64,
+                       help='Batch size for sentiment analysis (default: 64, increase for GPU)')
+    parser.add_argument('--limit', type=int, default=None,
+                       help='Limit number of records to process (useful for quick testing)')
+    parser.add_argument('--no-time-series', action='store_true',
+                       help='Skip the sentiment-over-time plot')
 
     args = parser.parse_args()
 
@@ -464,26 +670,34 @@ Examples:
             messages = ChatLogParser.parse_csv(args.input_file)
         elif file_ext == '.json':
             messages = ChatLogParser.parse_json(args.input_file)
+        elif file_ext == '.jsonl':
+            messages = ChatLogParser.parse_jsonl(args.input_file, max_records=args.limit)
         else:
             print(f"Error: Unsupported file type: {file_ext}")
-            print("Supported types: .html, .csv, .json")
+            print("Supported types: .html, .csv, .json, .jsonl")
             return
     except Exception as e:
         print(f"Error parsing file: {e}")
         return
 
+    if args.limit is not None and file_ext != '.jsonl':
+        messages = messages[:args.limit * 2]  # *2 to account for User+AI pairs
+
     print(f"Found {len(messages)} messages")
 
-    # Preprocess messages
+    # Preprocess messages in parallel
     print("\nPreprocessing messages...")
     preprocessor = TextPreprocessor()
-    valid_messages = []
 
-    for msg in messages:
-        cleaned_text = preprocessor.clean_text(msg['text'])
-        if preprocessor.is_valid_message(cleaned_text, min_length=args.min_length):
-            msg['text'] = cleaned_text
-            valid_messages.append(msg)
+    def _process(msg):
+        cleaned = preprocessor.clean_text(msg['text'])
+        if preprocessor.is_valid_message(cleaned, min_length=args.min_length):
+            return {**msg, 'text': cleaned}
+        return None
+
+    workers = min(8, (len(messages) // 100) or 1)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        valid_messages = [m for m in executor.map(_process, messages) if m is not None]
 
     print(f"Valid messages after preprocessing: {len(valid_messages)}")
 
@@ -503,6 +717,10 @@ Examples:
     # Create visualization
     visualizer = SentimentVisualizer()
     visualizer.plot_sentiment_comparison(results_df, output_path=args.output)
+
+    if not args.no_time_series:
+        print("\nGenerating sentiment-over-time plot...")
+        visualizer.plot_sentiment_over_time(results_df, output_path=args.output)
 
 
 if __name__ == "__main__":

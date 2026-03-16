@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import re
+from collections import defaultdict, deque
 from functools import lru_cache
 from datetime import datetime
 from pathlib import Path
@@ -381,7 +382,7 @@ def score_messages(messages, model, batch_size=256, use_word_vectors=False, max_
 
 	log_progress(f"[progress] ready for sentiment scoring: {len(filtered_features)} messages")
 	if not filtered_features:
-		return pd.DataFrame(columns=["speaker", "timestamp", "datetime_parsed", "sentiment_label", "sentiment_score"])
+		return pd.DataFrame(columns=["speaker", "text", "timestamp", "datetime_parsed", "sentiment_label", "sentiment_score"])
 
 	# Score unique texts once, then map results back to all rows.
 	unique_texts = list(dict.fromkeys(filtered_features))
@@ -407,6 +408,7 @@ def score_messages(messages, model, batch_size=256, use_word_vectors=False, max_
 		rows.append(
 			{
 				"speaker": msg["speaker"],
+				"text": msg["text"],
 				"timestamp": msg["timestamp"],
 				"datetime_parsed": parse_timestamp(msg["timestamp"]),
 				"sentiment_label": label,
@@ -420,6 +422,123 @@ def score_messages(messages, model, batch_size=256, use_word_vectors=False, max_
 		df = df[df["sentiment_score"].abs() > neutral_threshold].copy()
 		log_progress(f"[progress] removed {before - len(df)} near-neutral rows (|score| <= {neutral_threshold})")
 	return df
+
+
+def load_original_records(path: str, limit=None):
+	ext = Path(path).suffix.lower()
+	if ext == ".json":
+		with open(path, encoding="utf-8") as f:
+			data = json.load(f)
+		if not isinstance(data, list):
+			raise ValueError("JSON input must be a list")
+		return data[:limit] if limit else data
+
+	if ext == ".jsonl":
+		records = []
+		with open(path, encoding="utf-8") as f:
+			for i, line in enumerate(f):
+				if limit is not None and i >= limit:
+					break
+				if line.strip():
+					records.append(json.loads(line))
+		return records
+
+	if ext == ".csv":
+		df = pd.read_csv(path)
+		if limit is not None:
+			df = df.head(limit)
+		return df.to_dict("records")
+
+	if ext == ".html":
+		messages = load_html(path)
+		if limit is not None:
+			messages = messages[: limit * 2]
+		records = []
+		pending_prompt = None
+		for msg in messages:
+			speaker = str(msg.get("speaker", "")).strip().lower()
+			if speaker == "user":
+				pending_prompt = msg
+			elif speaker == "ai":
+				records.append(
+					{
+						"instruction": (pending_prompt or {}).get("text", ""),
+						"response": msg.get("text", ""),
+						"timestamp": msg.get("timestamp", (pending_prompt or {}).get("timestamp", "N/A")),
+					}
+				)
+				pending_prompt = None
+		if pending_prompt:
+			records.append(
+				{
+					"instruction": pending_prompt.get("text", ""),
+					"response": "",
+					"timestamp": pending_prompt.get("timestamp", "N/A"),
+				}
+			)
+		return records
+
+	raise ValueError("Supported types for JSON export: .html, .csv, .json, .jsonl")
+
+
+def build_sentiment_lookup(scored_df: pd.DataFrame):
+	lookup = defaultdict(deque)
+	for row in scored_df.itertuples(index=False):
+		key = (str(row.speaker).strip(), str(row.text).strip(), str(row.timestamp).strip())
+		lookup[key].append(
+			{
+				"sentiment_score": float(row.sentiment_score),
+				"sentiment_label": str(row.sentiment_label),
+			}
+		)
+	return lookup
+
+
+def pop_sentiment(lookup, speaker: str, text: str, timestamp: str):
+	key = (str(speaker).strip(), str(text).strip(), str(timestamp).strip())
+	if lookup.get(key):
+		return lookup[key].popleft()
+	return {"sentiment_score": None, "sentiment_label": None}
+
+
+def export_training_json(input_path: Path, scored_df: pd.DataFrame, output_path: Path, limit=None):
+	original_records = load_original_records(str(input_path), limit=limit)
+	lookup = build_sentiment_lookup(scored_df)
+
+	enriched = []
+	for rec in original_records:
+		item = dict(rec)
+		ts_value = str(
+			item.get("timestamp")
+			or item.get("datetime")
+			or item.get("created_at")
+			or item.get("time")
+			or item.get("date")
+			or "N/A"
+		)
+
+		if "instruction" in item or "prompt" in item or "response" in item or "repsonse" in item:
+			prompt_text = str(item.get("instruction") or item.get("prompt") or "").strip()
+			response_text = str(item.get("response") or item.get("repsonse") or "").strip()
+			prompt_sentiment = pop_sentiment(lookup, "User", prompt_text, ts_value)
+			response_sentiment = pop_sentiment(lookup, "AI", response_text, ts_value)
+			item["prompt_sentiment_score"] = prompt_sentiment["sentiment_score"]
+			item["prompt_sentiment_label"] = prompt_sentiment["sentiment_label"]
+			item["response_sentiment_score"] = response_sentiment["sentiment_score"]
+			item["response_sentiment_label"] = response_sentiment["sentiment_label"]
+		elif "speaker" in item and "text" in item:
+			speaker = str(item.get("speaker", "")).strip()
+			text = str(item.get("text", "")).strip()
+			sentiment = pop_sentiment(lookup, speaker, text, ts_value)
+			item["sentiment_score"] = sentiment["sentiment_score"]
+			item["sentiment_label"] = sentiment["sentiment_label"]
+
+		enriched.append(item)
+
+	with open(output_path, "w", encoding="utf-8") as f:
+		json.dump(enriched, f, ensure_ascii=False, indent=2)
+
+	log_progress(f"Saved training JSON: {output_path}")
 
 
 def plot_sentiment_timeline(df, output_path="sentiment_over_time.png"):
@@ -507,6 +626,11 @@ def main():
 	parser.add_argument("--use-word-vectors", action="store_true", help="Enable notebook-style word2vec averaging (slower)")
 	parser.add_argument("--neutral-threshold", type=float, default=0.0, help="Drop near-neutral scores where |score| <= threshold")
 	parser.add_argument("--ultra-fast", action="store_true", help="Aggressive speed mode")
+	parser.add_argument(
+		"--export-json",
+		default=None,
+		help="Output JSON path with original records plus sentiment scores (default: <input_stem>_with_sentiment.json)",
+	)
 	args = parser.parse_args()
 
 	if args.ultra_fast:
@@ -541,6 +665,15 @@ def main():
 
 	log_progress("[progress] generating timeline plot...")
 	plot_sentiment_timeline(scored_df, output_path=args.output)
+
+	export_json_path = Path(args.export_json) if args.export_json else input_path.with_name(f"{input_path.stem}_with_sentiment.json")
+	log_progress("[progress] exporting training JSON...")
+	export_training_json(
+		input_path=input_path,
+		scored_df=scored_df,
+		output_path=export_json_path,
+		limit=args.limit,
+	)
 	log_progress("[progress] done")
 
 

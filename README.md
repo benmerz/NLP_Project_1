@@ -1,3 +1,10 @@
+final.py is the working up to date script 
+run like this in command line: python final.py usethisdata.jsonl --ultra-fast
+
+
+
+
+
 # LLM Chat Log Sentiment Analysis
 
 A Python script that performs sentiment analysis on chat logs from LLM conversations (Gemini, Bard, ChatGPT, etc.) and visualizes the results.

@@ -1,6 +1,6 @@
 final.py is the working up to date script 
 run like this in command line: python final.py usethisdata.jsonl --ultra-fast
-
+or use MyActivity.html to get fastest run
 
 
 

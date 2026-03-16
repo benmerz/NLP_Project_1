@@ -48,6 +48,30 @@ python sentiment_analysis.py chats.csv --export detailed_results.csv
 
 ## Supported File Formats
 
+## Repository Data Files
+
+This repository includes several data files with different formats and sizes:
+
+- `data.json` (~3.2 MB, 3,276,686 bytes)
+  - Format: JSON array
+  - Content: Instruction-tuning style records with fields like `instruction`, `context`, `response`, and `category`
+  - Typical use: Convenient for tools/scripts that prefer a single JSON document
+
+- `data.jsonl` (~3.2 MB, 3,289,387 bytes, 3,753 lines/records)
+  - Format: JSON Lines (one JSON object per line)
+  - Content: Same type of instruction/context/response/category records as `data.json`
+  - Typical use: Streaming and line-by-line processing in NLP pipelines
+
+- `databricks.jsonl` (~13 MB, 13,085,339 bytes, 15,010 lines/records)
+  - Format: JSON Lines
+  - Content: A larger instruction dataset with the same core schema (`instruction`, `context`, `response`, `category`)
+  - Typical use: Larger-scale preprocessing, training, or benchmarking
+
+- `MyActivity.html` (~2.4 MB)
+  - Format: Google Takeout HTML export
+  - Content: Raw chat/activity history (used as an input source for parsing and sentiment analysis)
+  - Typical use: Real conversation log input for `sentiment_analysis.py`
+
 ### 1. HTML (Google Takeout - Gemini Apps)
 
 Export your Gemini chat history using [Google Takeout](https://takeout.google.com/):
